@@ -14,12 +14,21 @@ from __future__ import annotations
 import random
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 import numpy as np
 from fastapi import Depends, FastAPI, HTTPException, Header, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+
+# Import generation utilities
+from data_generator import (
+    generate_model_info,
+    generate_business_metrics,
+    generate_drift_metrics,
+    calculate_metrics_from_paths,
+)
 
 app = FastAPI(title="Vision Dashboard API", version="0.1.0")
 
@@ -133,32 +142,33 @@ class ModelInfo(BaseModel):
     name: str
     labels: List[str]
     stats: ModelStatistics
+    drift: Optional[Dict[str, Any]] = None  # optional drift metrics
+    restricted: Optional[bool] = None  # whether model was registered via client module
+    connector: Optional[str] = None
+
+# In-memory list of models registered by users.  If empty a default set is returned.
+registered_models: List[ModelInfo] = []
 
 @app.get("/models", response_model=List[ModelInfo])
 def get_models(_: str = Depends(get_current_username)) -> List[ModelInfo]:
-    """Return a list of models and associated statistics."""
-    models: List[ModelInfo] = []
-    # Generate three dummy models
-    for i in range(3):
-        num_features = random.randint(3, 6)
-        feature_names = [f"feature_{j+1}" for j in range(num_features)]
-        coefficients = np.random.randn(num_features).round(3).tolist()
-        feature_means = np.random.rand(num_features).round(3).tolist()
-        # For simplicity coefficient variance is positive values derived from random numbers
-        coefficient_variance = (np.random.rand(num_features) * 0.5).round(3).tolist()
-        model = ModelInfo(
-            id=str(uuid.uuid4()),
-            name=f"Model {i+1}",
-            labels=["class_0", "class_1"],
-            stats=ModelStatistics(
-                feature_names=feature_names,
-                coefficients=coefficients,
-                feature_means=feature_means,
-                coefficient_variance=coefficient_variance,
-            ),
+    """Return a list of models and associated statistics.
+
+    If the user has registered models via the model metadata workflow these are
+    returned.  Otherwise a default set of banking‑related models is generated.
+    """
+    if registered_models:
+        return registered_models
+    # Otherwise generate default models
+    models_data = generate_model_info(3)
+    return [
+        ModelInfo(
+            id=m["id"],
+            name=m["name"],
+            labels=m["labels"],
+            stats=ModelStatistics(**m["stats"]),
         )
-        models.append(model)
-    return models
+        for m in models_data
+    ]
 
 # -------------------------------------------------------------------
 # Business Metrics Endpoint
@@ -177,19 +187,11 @@ class BusinessMetricsResponse(BaseModel):
 @app.get("/business-metrics", response_model=BusinessMetricsResponse)
 def business_metrics(_: str = Depends(get_current_username)) -> BusinessMetricsResponse:
     """Return business metrics such as cost, resource utilisation and model performance."""
-    # Create a common time range (last 12 months)
-    now = datetime.utcnow()
-    months = [now - timedelta(days=30 * i) for i in reversed(range(12))]
-    timestamps = [m.strftime("%Y-%m-%d") for m in months]
-
-    def random_series(name: str, baseline: float) -> MetricSeries:
-        values = (baseline + 0.1 * np.random.randn(12)).round(3).tolist()
-        return MetricSeries(name=name, timestamps=timestamps, values=values)
-
+    metrics = generate_business_metrics()
     return BusinessMetricsResponse(
-        cost=random_series("Cost ($k)", 100.0),
-        resource_utilization=random_series("Resource Utilization (%)", 70.0),
-        performance=random_series("Model Accuracy (%)", 85.0),
+        cost=MetricSeries(**metrics["cost"]),
+        resource_utilization=MetricSeries(**metrics["resource_utilization"]),
+        performance=MetricSeries(**metrics["performance"]),
     )
 
 # -------------------------------------------------------------------
@@ -204,12 +206,11 @@ class DriftResponse(BaseModel):
 @app.get("/drift", response_model=DriftResponse)
 def drift(_: str = Depends(get_current_username)) -> DriftResponse:
     """Return dummy drift statistics."""
-    score = random.random()
-    details = {f"feature_{i+1}": round(random.random(), 3) for i in range(5)}
+    drift_data = generate_drift_metrics(5)
     return DriftResponse(
-        drift_score=round(score, 3),
-        drift_detected=score > 0.7,
-        details=details,
+        drift_score=drift_data["drift_score"],
+        drift_detected=drift_data["drift_detected"],
+        details=drift_data["details"],
     )
 
 # -------------------------------------------------------------------
@@ -276,3 +277,92 @@ def notifications(_: str = Depends(get_current_username)) -> List[Notification]:
             )
         )
     return notifs
+
+# -------------------------------------------------------------------
+# Model Metadata Registration
+# -------------------------------------------------------------------
+
+class ModelRegisterRequest(BaseModel):
+    restricted: bool = Field(..., description="Whether the model data is restricted and must be processed client side")
+    model_name: str = Field(..., description="Name of the model to register")
+    connector: str = Field(..., description="Name of the connector where the model/data resides")
+    connector_details: Optional[Dict[str, str]] = Field(
+        default=None, description="Additional parameters required for the connector (e.g. bucket, path)"
+    )
+    training_data_path: Optional[str] = Field(default=None, description="Path to the training data (if unrestricted)")
+    production_data_path: Optional[str] = Field(default=None, description="Path to the production data (if unrestricted)")
+
+class ModelRegisterResponse(BaseModel):
+    message: str
+    instructions: Optional[str] = None
+    metrics: Optional[Dict[str, Any]] = None
+
+class ClientMetricsRequest(BaseModel):
+    model_name: str
+    metrics: Dict[str, Any]
+
+@app.post("/model-metadata/register", response_model=ModelRegisterResponse)
+def register_model(data: ModelRegisterRequest, username: str = Depends(get_current_username)) -> ModelRegisterResponse:
+    """
+    Register a model and optionally compute metrics.
+
+    If the model is restricted (data cannot leave the client environment) the
+    endpoint returns instructions for running the client module locally.  If
+    unrestricted the server will calculate metrics on the provided data
+    immediately and store the result.
+    """
+    if data.restricted:
+        instructions = (
+            "Data is marked as restricted. Please download the client module from /client-module "
+            "and run it on the machine where the data resides using the following command:\n"
+            "python client_module.py --server-url <server_url> --token <access_token> "
+            f"--model-name '{data.model_name}' --training-data <training_path> --production-data <production_path>"
+        )
+        # For restricted models we don't compute metrics here; metrics will be uploaded later.
+        return ModelRegisterResponse(message="Model registration initiated in restricted mode", instructions=instructions)
+    # Unrestricted: compute metrics on the server using provided paths
+    if not data.training_data_path or not data.production_data_path:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="training_data_path and production_data_path are required for unrestricted models")
+    metrics = calculate_metrics_from_paths(data.training_data_path, data.production_data_path)
+    new_model = ModelInfo(
+        id=str(uuid.uuid4()),
+        name=data.model_name,
+        labels=["no", "yes"],
+        stats=ModelStatistics(**metrics["stats"]),
+        drift=metrics["drift"],
+        restricted=False,
+        connector=data.connector,
+    )
+    registered_models.append(new_model)
+    return ModelRegisterResponse(message="Model registered successfully", metrics=metrics)
+
+@app.post("/model-metadata/submit", response_model=ModelRegisterResponse)
+def submit_client_metrics(data: ClientMetricsRequest, username: str = Depends(get_current_username)) -> ModelRegisterResponse:
+    """
+    Submit metrics computed on a client machine.
+
+    This endpoint allows a client running in a restricted environment to upload
+    the aggregated metrics for a model.  The server stores the model and
+    acknowledges receipt.
+    """
+    # Extract metrics from payload
+    metrics = data.metrics
+    # Build ModelInfo
+    new_model = ModelInfo(
+        id=str(uuid.uuid4()),
+        name=data.model_name,
+        labels=["no", "yes"],
+        stats=ModelStatistics(**metrics["stats"]),
+        drift=metrics.get("drift"),
+        restricted=True,
+        connector=None,
+    )
+    registered_models.append(new_model)
+    return ModelRegisterResponse(message="Metrics received and model registered")
+
+@app.get("/client-module")
+def download_client_module(_: str = Depends(get_current_username)):
+    """Provide the client module for download."""
+    # The client module is located in the same directory as this script
+    module_path = __file__.replace("main.py", "client_module.py")
+    return FileResponse(module_path, media_type="text/x-python", filename="client_module.py")
