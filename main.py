@@ -145,6 +145,8 @@ class ModelInfo(BaseModel):
     drift: Optional[Dict[str, Any]] = None  # optional drift metrics
     restricted: Optional[bool] = None  # whether model was registered via client module
     connector: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None  # additional registration metadata
+    business_metrics: Optional[Dict[str, Any]] = None  # metrics specific to this model
 
 # In-memory list of models registered by users.  If empty a default set is returned.
 registered_models: List[ModelInfo] = []
@@ -279,6 +281,52 @@ def notifications(_: str = Depends(get_current_username)) -> List[Notification]:
     return notifs
 
 # -------------------------------------------------------------------
+# Model-specific Business Metrics and Drift
+# -------------------------------------------------------------------
+
+@app.get("/business-metrics/{model_id}", response_model=BusinessMetricsResponse)
+def business_metrics_for_model(model_id: str, _: str = Depends(get_current_username)) -> BusinessMetricsResponse:
+    """Return business metrics for a specific model."""
+    # Find the model in the registered list
+    for m in registered_models:
+        if m.id == model_id:
+            # Use stored metrics if available
+            if m.business_metrics:
+                bm = m.business_metrics
+                return BusinessMetricsResponse(
+                    cost=MetricSeries(**bm["cost"]),
+                    resource_utilization=MetricSeries(**bm["resource_utilization"]),
+                    performance=MetricSeries(**bm["performance"]),
+                )
+    # If not found or no metrics, return generated metrics
+    bm = generate_business_metrics()
+    return BusinessMetricsResponse(
+        cost=MetricSeries(**bm["cost"]),
+        resource_utilization=MetricSeries(**bm["resource_utilization"]),
+        performance=MetricSeries(**bm["performance"]),
+    )
+
+
+@app.get("/drift/{model_id}", response_model=DriftResponse)
+def drift_for_model(model_id: str, _: str = Depends(get_current_username)) -> DriftResponse:
+    """Return drift metrics for a specific model."""
+    for m in registered_models:
+        if m.id == model_id and m.drift:
+            d = m.drift
+            return DriftResponse(
+                drift_score=d["drift_score"],
+                drift_detected=d["drift_detected"],
+                details=d["details"],
+            )
+    # Otherwise generate dummy
+    d = generate_drift_metrics(5)
+    return DriftResponse(
+        drift_score=d["drift_score"],
+        drift_detected=d["drift_detected"],
+        details=d["details"],
+    )
+
+# -------------------------------------------------------------------
 # Model Metadata Registration
 # -------------------------------------------------------------------
 
@@ -292,6 +340,13 @@ class ModelRegisterRequest(BaseModel):
     training_data_path: Optional[str] = Field(default=None, description="Path to the training data (if unrestricted)")
     production_data_path: Optional[str] = Field(default=None, description="Path to the production data (if unrestricted)")
 
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Additional model metadata (version, description, author, training parameters, deployment info, compliance, etc.)"
+        ),
+    )
+
 class ModelRegisterResponse(BaseModel):
     message: str
     instructions: Optional[str] = None
@@ -300,6 +355,7 @@ class ModelRegisterResponse(BaseModel):
 class ClientMetricsRequest(BaseModel):
     model_name: str
     metrics: Dict[str, Any]
+    metadata: Optional[Dict[str, Any]] = None
 
 @app.post("/model-metadata/register", response_model=ModelRegisterResponse)
 def register_model(data: ModelRegisterRequest, username: str = Depends(get_current_username)) -> ModelRegisterResponse:
@@ -332,6 +388,8 @@ def register_model(data: ModelRegisterRequest, username: str = Depends(get_curre
         drift=metrics["drift"],
         restricted=False,
         connector=data.connector,
+        metadata=data.metadata,
+        business_metrics=generate_business_metrics(),
     )
     registered_models.append(new_model)
     return ModelRegisterResponse(message="Model registered successfully", metrics=metrics)
@@ -356,6 +414,8 @@ def submit_client_metrics(data: ClientMetricsRequest, username: str = Depends(ge
         drift=metrics.get("drift"),
         restricted=True,
         connector=None,
+        metadata=data.metadata,
+        business_metrics=generate_business_metrics(),
     )
     registered_models.append(new_model)
     return ModelRegisterResponse(message="Metrics received and model registered")
